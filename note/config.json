@@ -1,0 +1,7 @@
+{
+    "litellm_config":{
+        "model": "ollama/llama3",
+        "api_base": "http://localhost:11434"
+    },
+    "notes_storage": "~/notes_storage"
+}
