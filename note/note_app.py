@@ -34,6 +34,23 @@ For example, "appointment", "medical". Output should be json in a form
 Output should be ONLY the json
 """
 
+SEARCH_PROMPT = """
+You are a note-taking assistant. User will prompt you with search request and notes to search through.
+Notes are json files in a format.
+```
+{
+    "processed_message": normalized_message,
+    "tags": ["tag1", "tag2",...,"tagn"],
+    "message_id": id 
+}
+```
+Notes are at the start of this message
+Your task is to find relevant notes, and give answer as json list.
+[message_id1, message_id2, message_id3, ..., message_idn ]
+Answer only with list
+You query is:
+"""
+
 
 @click.group()
 def cli():
@@ -65,7 +82,7 @@ def create_tags(path):
 def add(msg):
     current_date = datetime.datetime.now()
     date_str = current_date
-    weekday = current_date.weekday
+    weekday = current_date.strftime("%A")
     today_str = f"Today is {date_str} {weekday}."
     response = completion(
         messages=[
@@ -119,10 +136,8 @@ def add(msg):
     # handling tags
     tags = create_tags(f"{CONFIG.notes_storage}/tags")
     # if tags not empty, update
-    print(tags)
     if note.tags:
         for t in note.tags:
-            print(t)
             if t not in tags:
                 tags.append(t)
         with open(f"{CONFIG.notes_storage}/tags", "w") as f:
@@ -158,6 +173,61 @@ def search(query, type, n):
         for i in top_k[0]:
             print("-" * 80)
             Note.from_json(notes[i]).show()
+    if type == "llm":
+        # TODO reduce copy-paste
+        current_date = datetime.datetime.now()
+        date_str = current_date
+        weekday = current_date.strftime("%A")
+        today_str = f"Today is {date_str} {weekday}."
+        note_list = []
+        note_dict_list = []
+        for i, n in enumerate(notes):
+            note_dict_list.append(Note.from_json(n))
+            with open(n) as f:
+                note = json.load(f)
+                note["message_id"] = i
+                note_list.append(json.dumps(note, indent=2))
+        notes_str = os.linesep.join(note_list)
+        response = completion(
+            messages=[
+                {
+                    "content": today_str
+                    + notes_str
+                    + SEARCH_PROMPT
+                    + f"Your query is '{query}'",
+                    "role": "user",
+                },
+            ],
+            **CONFIG.litellm_config,
+        )
+        # TODO better error hadling in case of something unexpected
+        json_pattern = r"({[^{}]*}|[\[{].*[\]}])"
+
+        max_retries = 3
+        succeded = False
+        for i in range(max_retries):
+            try:
+                # llama3 sometimes adds additional text, so it's easier to simply find json and try to load it
+                import ipdb
+
+                ipdb.set_trace()
+                possible_json = re.findall(
+                    json_pattern, response["choices"][0]["message"].content, re.DOTALL
+                )
+                ids = json.loads(possible_json[0])
+                relevant_notes = [note_dict_list[j] for j in ids]
+                succeded = True
+                break
+            except json.JSONDecodeError:
+                # simply continue
+                pass
+        if not succeded:
+            raise ValueError(
+                f"LLM returned not a valid json {max_retries} in a row, you might try again or change message. LLM message was {response['choices'][0]['message'].content}"
+            )
+        for n in relevant_notes:
+            print("-" * 80)
+            n.show()
 
 
 @cli.command()
@@ -173,6 +243,27 @@ def show(
     for n in notes:
         print("-" * 80)
         Note.from_json(n).show()
+
+
+@cli.command()
+@click.option(
+    "--show",
+    type=str,
+    help="Shows notes with a particular tag. If not given, all the tags are shown",
+    default="",
+)
+def tag(show):
+    if not show:
+        tags = create_tags(f"{CONFIG.notes_storage}/tags")
+        # show all available tags
+        print(tags)
+    else:
+        notes = sorted(glob(f"{CONFIG.notes_storage}/*.json"))
+        for n in notes:
+            note = Note.from_json(n)
+            if show in note.tags:
+                print("-" * 80)
+                note.show()
 
 
 @cli.command()
