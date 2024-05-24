@@ -1,10 +1,15 @@
 import datetime
 import json
+import os
+import re
+import shutil
 from glob import glob
 from pathlib import Path
 
 import click
+import faiss
 from litellm import completion
+from sentence_transformers import SentenceTransformer
 
 from .config import Config
 from .note import Note
@@ -12,8 +17,12 @@ from .note import Note
 CONFIG = Config.from_json(Path(__file__).resolve().parent / "config.json")
 
 PROMPT = """
-You are a note-taking assistant. User will prompt you with notes. Some notes could be imperative, like "Remind me about dentist appointment on weekends".
-Others could be simple sentences. Normalize note to be simple sentences. If there's a time reference in a message, try converting it to a particular date, given today's date. So instead of tomorrow there will be date in normalized message
+You are a note-taking assistant. User will prompt you with notes. It can be appointments, todos,
+interesting facts, important dates, foreign words translation, studying materials, person contacts or anythong else.
+Some notes could be imperative, like "Remind me about dentist appointment on weekends".
+Others could be simple sentences. Normalize note to be simple sentences.
+If there's a time reference in a message, try converting it to a particular date, given today's date.
+So instead of tomorrow there will be date in normalized message.
 For each note try to detect it's broader meaning and assign tags, if possible.
 For example, "appointment", "medical". Output should be json in a form
 ```
@@ -31,37 +40,124 @@ def cli():
     pass
 
 
+def create_index(path, d=None):
+    if Path(path).exists():
+        index = faiss.read_index(path)
+    elif d is not None:
+        # simple brute-force for small scales
+        index = faiss.IndexFlatL2(d)
+    else:
+        raise ValueError("Index doesn't exist, and dimension d wasn't given")
+    return index
+
+
+def create_tags(path):
+    if Path(path).exists():
+        with open(path) as f:
+            tags = list(sorted(([l.strip() for l in f])))
+    else:
+        tags = list()
+    return tags
+
+
 @cli.command()
 @click.argument("msg")
 def add(msg):
     current_date = datetime.datetime.now()
     date_str = current_date
     weekday = current_date.weekday
+    today_str = f"Today is {date_str} {weekday}."
     response = completion(
-        model="ollama/llama3",
         messages=[
-            {"content": f"Today is {date_str} {weekday}." + PROMPT, "role": "system"},
+            {"content": f"{today_str}" + PROMPT, "role": "system"},
             {"content": msg, "role": "user"},
         ],
-        api_base="http://localhost:11434",
+        **CONFIG.litellm_config,
     )
     # TODO better error hadling in case of something unexpected
-    max_reties = 3
+    json_pattern = r"({[^{}]*}|[\[{].*[\]}])"
+
+    max_retries = 3
     succeded = False
-    for i in range(max_reties):
+    for i in range(max_retries):
         try:
-            d = json.loads(response["choices"][0]["message"].content)
+            # llama3 sometimes adds additional text, so it's easier to simply find json and try to load it
+            possible_json = re.findall(
+                json_pattern, response["choices"][0]["message"].content, re.DOTALL
+            )
+            d = json.loads(possible_json[0])
             d["creation_date"] = current_date
             d["initial_message"] = msg
             note = Note(**d)
             note.to_json()
+            # let's compile all the bits together and apply sentence transformer
+            sentence_msg = (
+                f"{today_str} {msg} {note.processed_message}. Tags: {note.tags}"
+            )
+            # according to here, this is a good model to use
+            # https://huggingface.co/blog/mteb
+            sentence_model = SentenceTransformer(
+                "sentence-transformers/all-mpnet-base-v2"
+            )
+            emb = sentence_model.encode(sentence_msg)
             succeded = True
             break
         except json.JSONDecodeError:
             # simply continue
             pass
     if not succeded:
-        raise ValueError("Something unexpected happened")
+        raise ValueError(
+            f"LLM returned not a valid json {max_retries} in a row, you might try again or change message. LLM message was {response['choices'][0]['message'].content}"
+        )
+
+    # for checking results
+    note.show()
+    # handling index
+    index = create_index(f"{CONFIG.notes_storage}/index", d=emb.shape[0])
+    index.add(emb[None, :])
+    faiss.write_index(index, f"{CONFIG.notes_storage}/index")
+    # handling tags
+    tags = create_tags(f"{CONFIG.notes_storage}/tags")
+    # if tags not empty, update
+    print(tags)
+    if note.tags:
+        for t in note.tags:
+            print(t)
+            if t not in tags:
+                tags.append(t)
+        with open(f"{CONFIG.notes_storage}/tags", "w") as f:
+            f.write(os.linesep.join(list(tags)))
+
+
+@cli.command()
+@click.argument("query")
+@click.option(
+    "--type",
+    type=click.Choice(["sent", "llm"]),
+    default="sent",
+    help="Search type. Options: [sent, llm], sent is for sentence embedding search, and llm is for brute-force query approach",
+)
+@click.option("--n", type=int, default=10, help="How much notes to show")
+def search(query, type, n):
+    notes = list(sorted(glob(f"{CONFIG.notes_storage}/*.json")))
+    if type == "sent":
+        # let's search for all the notes first
+        # because the filename is date,
+        # their sorted list can be directly related to index
+        index = create_index(f"{CONFIG.notes_storage}/index")
+
+        current_date = datetime.datetime.now()
+        date_str = current_date
+        weekday = current_date.weekday
+        today_str = f"Today is {date_str} {weekday}."
+
+        sentence_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+        emb = sentence_model.encode(today_str + query)
+
+        scores, top_k = index.search(emb[None,], n)
+        for i in top_k[0]:
+            print("-" * 80)
+            Note.from_json(notes[i]).show()
 
 
 @cli.command()
@@ -73,11 +169,15 @@ def show(
     n,
     ascending,
 ):
-    print(ascending)
     notes = sorted(glob(f"{CONFIG.notes_storage}/*.json"), reverse=not ascending)
     for n in notes:
         print("-" * 80)
         Note.from_json(n).show()
+
+
+@cli.command()
+def clear_all():
+    shutil.rmtree(CONFIG.notes_storage)
 
 
 if __name__ == "__main__":
