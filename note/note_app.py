@@ -51,6 +51,8 @@ Answer only with list
 You query is:
 """
 
+CHAT_PROMPT = "Given this collection of notes in json format, answer this question:"
+
 
 @click.group()
 def cli():
@@ -181,6 +183,7 @@ def search(query, type, n):
         today_str = f"Today is {date_str} {weekday}."
         note_list = []
         note_dict_list = []
+        max_notes = n
         for i, n in enumerate(notes):
             note_dict_list.append(Note.from_json(n))
             with open(n) as f:
@@ -208,9 +211,6 @@ def search(query, type, n):
         for i in range(max_retries):
             try:
                 # llama3 sometimes adds additional text, so it's easier to simply find json and try to load it
-                import ipdb
-
-                ipdb.set_trace()
                 possible_json = re.findall(
                     json_pattern, response["choices"][0]["message"].content, re.DOTALL
                 )
@@ -225,9 +225,51 @@ def search(query, type, n):
             raise ValueError(
                 f"LLM returned not a valid json {max_retries} in a row, you might try again or change message. LLM message was {response['choices'][0]['message'].content}"
             )
-        for n in relevant_notes:
+        for n in relevant_notes[:max_notes]:
             print("-" * 80)
             n.show()
+
+
+@cli.command()
+@click.argument("query", type=str)
+def chat(query):
+    notes = list(sorted(glob(f"{CONFIG.notes_storage}/*.json")))
+    # TODO really reduce copy-paste
+    current_date = datetime.datetime.now()
+    date_str = current_date
+    weekday = current_date.strftime("%A")
+    today_str = f"Today is {date_str} {weekday}."
+    note_list = []
+    note_dict_list = []
+    for i, n in enumerate(notes):
+        note_dict_list.append(Note.from_json(n))
+        with open(n) as f:
+            note = json.load(f)
+            note["message_id"] = i
+            note_list.append(json.dumps(note, indent=2))
+    notes_str = os.linesep.join(note_list)
+    history = today_str + notes_str + CHAT_PROMPT + f"Your query is '{query}'"
+    response = completion(
+        messages=[
+            {"content": history, "role": "user"},
+        ],
+        **CONFIG.litellm_config,
+    )
+    print(response["choices"][0]["message"].content)
+    history += response["choices"][0]["message"].content
+    # continue chat until Ctrl + C
+    while True:
+        next_question = input("> ")
+        history += next_question
+        # would be good to have better method for history, but I don't know if there are for APIs
+        response = completion(
+            messages=[
+                {"content": history, "role": "user"},
+            ],
+            **CONFIG.litellm_config,
+        )
+        print(response["choices"][0]["message"].content)
+        history += response["choices"][0]["message"].content
 
 
 @cli.command()
@@ -239,7 +281,9 @@ def show(
     n,
     ascending,
 ):
-    notes = sorted(glob(f"{CONFIG.notes_storage}/*.json"), reverse=not ascending)
+    notes = list(sorted(glob(f"{CONFIG.notes_storage}/*.json"), reverse=not ascending))[
+        :n
+    ]
     for n in notes:
         print("-" * 80)
         Note.from_json(n).show()
