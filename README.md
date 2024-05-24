@@ -184,3 +184,4 @@ Some thoughts about current implementation
 * both sentence embedding and LLM based search have their weak points. Embeddings are not always precise enough for correct retrieval and can't answer some particular requests and LLM often makes mistakes and selects less data. And you need to prompt it with all the notes and I feel like it hurts the performance. I think RAG should help with both approaches.
 * LLM makes mistakes with dates and sometimes with tags. Also processed LLM note is not always what you expect, so better model and further prompt engineering are required.
 * Chat with model also can be optimized with RAG.
+* Also sometimes 3 retries is not enough for LLM to process note correctly

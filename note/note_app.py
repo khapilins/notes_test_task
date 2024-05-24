@@ -281,9 +281,9 @@ def show(
     n,
     ascending,
 ):
-    notes = list(sorted(glob(f"{CONFIG.notes_storage}/*.json"), reverse=not ascending))[
-        :n
-    ]
+    notes = list(sorted(glob(f"{CONFIG.notes_storage}/*.json"), reverse=not ascending))
+    if n > 0:
+        notes = notes[:n]
     for n in notes:
         print("-" * 80)
         Note.from_json(n).show()
